@@ -1,5 +1,5 @@
 # api-segerahabis
-api for online shop segerahabis
+api for online shop segerahabis (still incomplete)
 
 
 ## DB diagram
