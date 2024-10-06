@@ -18,7 +18,7 @@ if you already have the exact table and records like the API's, here's the next 
 1. Clone the main repo
 2. Set the db and the table
 3. Set the creds on Dockerfile
-4. Build..... using ```docker build -t api-segerahabis```
+4. Build..... using ```docker build -t api-segerahabis .```
 5. Run with ```docker run -d -p 80:80 --name <desired-container-name> api-segerahabis```
 
 ## Troubleshoot
