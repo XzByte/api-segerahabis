@@ -13,7 +13,7 @@ the base db logic that i've been used on this project, with little bit improveme
 - Python 
 
 ## Howto
-This repo just providing the API logic, not the system entirely, so you should build your table and records db first before using this API's 
+This repo just providing the API logic, not the system entirely, so you should build your table and records db first before using this API's \
 if you already have the exact table and records like the API's, here's the next step : 
 1. Clone the main repo
 2. Set the db and the table
