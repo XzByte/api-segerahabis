@@ -7,9 +7,9 @@ api for online shop segerahabis
 the base db logic that i've been used on this project, with little bit improvement and change while working on this project... thanks alot for the example!
 
 ## Tech Stack
-~ SQL Server v9
-~ FastAPI
-~ Docker
-~ Python 
+- SQL Server v9
+- FastAPI
+- Docker
+- Python 
 
 
