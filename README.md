@@ -12,4 +12,13 @@ the base db logic that i've been used on this project, with little bit improveme
 - Docker
 - Python 
 
+## Howto
 
+1. Clone the main repo
+2. Set the db and the table
+3. Set the creds on Dockerfile
+4. Build..... using ```docker build -t api-segerahabis```
+5. Run with ```docker run -d -p 80:80 --name <desired-container-name> api-segerahabis```
+
+## Troubleshoot
+already following the step, but found or encounter some error? msg me!
