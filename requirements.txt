@@ -1,1 +1,8 @@
-
+fastapi
+pydantic
+mysql-connector-python
+python-dotenv
+bcrypt
+pyjwt
+uvicorn
+python-multipart
