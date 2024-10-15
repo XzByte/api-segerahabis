@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Path
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Path, Form
 from pydantic import BaseModel
 import mysql.connector
 import os
@@ -8,6 +8,7 @@ import uuid
 import jwt
 from datetime import datetime, timedelta, timezone
 from fastapi.middleware.cors import CORSMiddleware
+import base64
 origins = [
     "http://localhost:3000",
 ]
@@ -45,10 +46,10 @@ class TokenResponse(BaseModel):
     token_type: str
     
 class Product(BaseModel):
-    id: int
     name: str
     description: str
     price: float
+    availableItem: int
     
 class Order(BaseModel):
     id: int
@@ -79,7 +80,7 @@ def create_access_token(data: dict, expires_delta: timedelta = timedelta(days=30
     expire = datetime.now(timezone.utc) + expires_delta
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
-    return encoded_jwt
+    return encoded_jwt, expire
 
 async def get_current_user(x_token: str = Header(...)):
     payload = verify_token(x_token)
@@ -97,7 +98,7 @@ def verify_token(token: str):
 def is_token_blacklisted(token: str):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM TokenBlacklist WHERE token = %s", (token,))
+    cursor.execute("SELECT 1 FROM TokenBlacklist WHERE token = %s", (token))
     result = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -129,7 +130,19 @@ def login(login_request: LoginRequest):
     conn.close()
     
     if customer and bcrypt.checkpw(login_request.password.encode('utf-8'), customer[1].encode('utf-8')):
-        access_token = create_access_token(data={"sub": customer[0]})
+        access_token, expire = create_access_token(data={"sub": customer[0]})
+        
+        # Store the token in the Token table
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO Token (token, user_uuid, expiration_time) VALUES (%s, %s, %s)",
+            (access_token, customer[0], expire)
+        )
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
         return {"access_token": access_token, "token_type": "bearer"}
     else:
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -137,7 +150,7 @@ def login(login_request: LoginRequest):
 @app.post("/logout", dependencies=[Depends(get_current_user)])
 async def logout(x_token: str = Header(...), current_user: dict = Depends(get_current_user)):
     if is_token_blacklisted(x_token):
-        raise HTTPException(status_code=401, detail="Token is already blacklisted")
+        raise HTTPException(status_code=401, detail="Token is already busted")
     
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -165,13 +178,20 @@ def get_customer(customer_uuid: str):
 
 
 @app.post("/products/", dependencies=[Depends(get_current_user)])
-async def create_product(product: Product, image: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+async def create_product(
+    name: str = Form(...),
+    description: str = Form(...),
+    price: float = Form(...),
+    image: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
     image_data = await image.read()
+    owner_uuid = current_user["sub"]
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT INTO Product (id, name, description, price, image) VALUES (%s, %s, %s, %s, %s)",
-        (product.id, product.name, product.description, product.price, image_data)
+        "INSERT INTO Product (name, description, price, image, owner_uuid) VALUES (%s, %s, %s, %s, %s)",
+        (name, description, price, image_data, owner_uuid)
     )
     conn.commit()
     cursor.close()
@@ -182,51 +202,82 @@ async def create_product(product: Product, image: UploadFile = File(...), curren
 def get_product(product_id: int, current_user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, name, description, price, image FROM Product WHERE id = %s", (product_id,))
+    cursor.execute("SELECT id, name, description, price, availableItemCount, categoryId, owner_uuid, image FROM Product WHERE id = %s", (product_id,))
     product = cursor.fetchone()
     cursor.close()
     conn.close()
     if product:
-        return {"id": product[0], "name": product[1], "description": product[2], "price": product[3], "image": product[4]}
+        return {
+            "id": product[0],
+            "name": product[1],
+            "description": product[2],
+            "price": product[3],
+            "availableItem": product[4],
+            "categoryId": product[5],
+            "owner": {
+                "uuid": product[6]
+            },
+            "image": base64.b64encode(product[7]).decode('utf-8') if product[7] else None
+        }
     else:
         raise HTTPException(status_code=404, detail="Product not found")
     
     
-@app.put("/product/edit/{product_id}", dependencies=[Depends(get_current_user)])
+@app.put("/products/edit/{product_id}", dependencies=[Depends(get_current_user)])
 async def edit_product(
-    product: Product,
-    current_user: dict = Depends(get_current_user),
-    product_id: int = Path(..., ge=1)
+    product_id: int,
+    name: str = Form(...),
+    description: str = Form(...),
+    price: float = Form(...),
+    availableItem: int = Form(...),
+    categoryIds: str = Form(...),  # Accept categoryIds as a comma-separated string
+    image: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
 ):
+    image_data = await image.read()
+    owner_uuid = current_user["sub"]
+    
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    # Check if the product exists
-    cursor.execute("SELECT id FROM Product WHERE id = %s", (product_id,))
-    existing_product = cursor.fetchone()
     
-    if not existing_product:
+    cursor.execute("SELECT owner_uuid FROM Product WHERE id = %s", (product_id,))
+    product = cursor.fetchone()
+    if not product:
+        cursor.close()
+        conn.close()
         raise HTTPException(status_code=404, detail="Product not found")
-
-    # Update the product details
+    
+    if product[0] != owner_uuid:
+        cursor.close()
+        conn.close()
+        raise HTTPException(status_code=403, detail="You do not have permission to edit this product")
+    
+    # Update the product
     cursor.execute(
-        "UPDATE Product SET "
-        "name = %s, description = %s, price = %s, image = %s "
-        "WHERE id = %s",
-        (
-            product.name,
-            product.description,
-            product.price,
-            product.image,
-            product_id
-        )
+        "UPDATE Product SET name = %s, description = %s, price = %s, availableItemCount = %s, image = %s WHERE id = %s",
+        (name, description, price, availableItem, image_data, product_id)
     )
-
+    
+    # Update product-category mappings
+    cursor.execute("DELETE FROM ProductCategoryMapping WHERE product_id = %s", (product_id,))
+    try:
+        category_ids = [int(cid) for cid in categoryIds.split(',')]
+    except ValueError:
+        cursor.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid category ID format")
+    
+    for category_id in category_ids:
+        cursor.execute(
+            "INSERT INTO ProductCategoryMapping (product_id, category_id) VALUES (%s, %s)",
+            (product_id, category_id)
+        )
+    
     conn.commit()
     cursor.close()
     conn.close()
-
     return {"message": "Product updated successfully"}
+
 @app.get("/allproducts")
 def get_all_products():
     conn = get_db_connection()
@@ -243,16 +294,18 @@ def get_all_products():
             "name": product[1],
             "description": product[2],
             "price": product[3],
-            "categoryId": product[4],
+            "availableItem": product[4],
+            "categoryId": product[5],
             "owner": {
-                "uuid" : product[5]
+                "uuid": product[6]
             },
-            "image": product[6]
+            "image": base64.b64encode(product[7]).decode('utf-8') if product[7] else None
         })
     
     return product_list
+
 # Order endpoints
-@app.post("/orders/", dependencies=[Depends(get_current_user)])
+@app.post("/cart/", dependencies=[Depends(get_current_user)])
 def create_order(order: Order, current_user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -265,8 +318,8 @@ def create_order(order: Order, current_user: dict = Depends(get_current_user)):
     conn.close()
     return {"message": "Order created"}
 
-@app.get("/orders/{order_id}", dependencies=[Depends(get_current_user)])
-def get_order(order_id: int, current_user: dict = Depends(get_current_user)):
+@app.get("/cart/{order_id}", dependencies=[Depends(get_current_user)])
+def get_cart(order_id: int, current_user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM Orders WHERE id = %s", (order_id,))
@@ -277,6 +330,66 @@ def get_order(order_id: int, current_user: dict = Depends(get_current_user)):
     if order:
         return {"id": order[0], "customer_id": order[1], "product_id": order[2], "order_status": order[3]}
     raise HTTPException(status_code=404, detail="Order not found")
+
+@app.post("/cart/{user_uuid}/checkout", dependencies=[Depends(get_current_user)])
+def checkout_cart(user_uuid: str, current_user: dict = Depends(get_current_user)):
+    if user_uuid != current_user["sub"]:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Fetch cart items
+    cursor.execute("SELECT product_id, quantity FROM CartItem WHERE user_uuid = %s", (user_uuid,))
+    cart_items = cursor.fetchall()
+
+    if not cart_items:
+        raise HTTPException(status_code=400, detail="Cart is empty")
+
+    # Create order
+    order_uuid = str(uuid.uuid4())
+    cursor.execute(
+        "INSERT INTO `Order` (uuid, user_uuid, created_at) VALUES (%s, %s, %s)",
+        (order_uuid, user_uuid, datetime.now(datetime.timezone.utc))
+    )
+    conn.commit()
+
+    # Add items to order and calculate total
+    total_amount = 0
+    for item in cart_items:
+        product_id, quantity = item
+        cursor.execute("SELECT price FROM Product WHERE id = %s", (product_id,))
+        product = cursor.fetchone()
+        if product:
+            price = product[0]
+            total_amount += price * quantity
+            cursor.execute(
+                "INSERT INTO OrderItem (order_uuid, product_id, quantity, price) VALUES (%s, %s, %s, %s)",
+                (order_uuid, product_id, quantity, price)
+            )
+        else:
+            raise HTTPException(status_code=404, detail=f"Product with id {product_id} not found")
+
+    conn.commit()
+
+    # Clear cart
+    cursor.execute("DELETE FROM CartItem WHERE user_uuid = %s", (user_uuid,))
+    conn.commit()
+
+    cursor.close()
+    conn.close()
+
+    # Generate receipt
+    receipt = {
+        "order_uuid": order_uuid,
+        "user_uuid": user_uuid,
+        "total_amount": total_amount,
+        "items": [{"product_id": item[0], "quantity": item[1]} for item in cart_items],
+        "created_at": datetime.now(timezone.utc)
+    }
+
+    return receipt
+
 
 # Shipment endpoints
 @app.post("/shipments/", dependencies=[Depends(get_current_user)])
@@ -291,6 +404,8 @@ def create_shipment(shipment: Shipment, current_user: dict = Depends(get_current
     cursor.close()
     conn.close()
     return {"message": "Shipment created"}
+
+
 
 @app.get("/shipments/{shipment_id}", dependencies=[Depends(get_current_user)])
 def get_shipment(shipment_id: int, current_user: dict = Depends(get_current_user)):
@@ -359,62 +474,7 @@ def get_shipmentlog(shipmentlog_id: int, current_user: dict = Depends(get_curren
         return {"id": shipment_log[0], "shipment_id": shipment_log[1], "shipment_status": shipment_log[2]}
     raise HTTPException(status_code=404, detail="ShipmentLog not found")
 
-@app.post("/cart/{user_uuid}/checkout", dependencies=[Depends(get_current_user)])
-def checkout_cart(user_uuid: str, current_user: dict = Depends(get_current_user)):
-    if user_uuid != current_user["sub"]:
-        raise HTTPException(status_code=403, detail="Forbidden")
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    # Fetch cart items
-    cursor.execute("SELECT product_id, quantity FROM CartItem WHERE user_uuid = %s", (user_uuid,))
-    cart_items = cursor.fetchall()
-
-    if not cart_items:
-        raise HTTPException(status_code=400, detail="Cart is empty")
-
-    # Create order
-    order_uuid = str(uuid.uuid4())
-    cursor.execute(
-        "INSERT INTO `Order` (uuid, user_uuid, created_at) VALUES (%s, %s, %s)",
-        (order_uuid, user_uuid, datetime.now(datetime.timezone.utc))
-    )
-    conn.commit()
-
-    # Add items to order and calculate total
-    total_amount = 0
-    for item in cart_items:
-        product_id, quantity = item
-        cursor.execute("SELECT price FROM Product WHERE id = %s", (product_id,))
-        product = cursor.fetchone()
-        if product:
-            price = product[0]
-            total_amount += price * quantity
-            cursor.execute(
-                "INSERT INTO OrderItem (order_uuid, product_id, quantity, price) VALUES (%s, %s, %s, %s)",
-                (order_uuid, product_id, quantity, price)
-            )
-        else:
-            raise HTTPException(status_code=404, detail=f"Product with id {product_id} not found")
-
-    conn.commit()
-
-    cursor.execute("DELETE FROM CartItem WHERE user_uuid = %s", (user_uuid,))
-    conn.commit()
-
-    cursor.close()
-    conn.close()
-
-    receipt = {
-        "order_uuid": order_uuid,
-        "user_uuid": user_uuid,
-        "total_amount": total_amount,
-        "items": [{"product_id": item[0], "quantity": item[1]} for item in cart_items],
-        "created_at": datetime.now(timezone.utc)
-    }
-
-    return receipt
 @app.get('/api')
 def api():
     return {"message": "Welcome to the API"}
