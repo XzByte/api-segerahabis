@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File, Path, Form
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import mysql.connector
 import os
@@ -9,6 +10,8 @@ import jwt
 from datetime import datetime, timedelta, timezone
 from fastapi.middleware.cors import CORSMiddleware
 import base64
+from external.payment import get_payment_url
+import random
 origins = [
     "http://localhost:3000",
 ]
@@ -52,10 +55,10 @@ class Product(BaseModel):
     availableItem: int
     
 class Order(BaseModel):
-    id: int
-    customer_id: int
     product_id: int
-    order_status: str
+    quantity: int
+    total_amount: float
+    
 
 class Shipment(BaseModel):
     id: int
@@ -72,6 +75,18 @@ class ShipmentLog(BaseModel):
     shipment_id: int
     shipment_status: str
 
+class CustomerEditRequest(BaseModel):
+    name: str = None
+    shippingAddress: str = None
+    email: str = None
+    phone: str = None
+
+class ShoppingCartItemResponse(BaseModel):
+    product_id: int
+    name: str
+    quantity: int
+    price: float
+    
 def get_db_connection():
     return mysql.connector.connect(**db_config)
 
@@ -146,6 +161,49 @@ def login(login_request: LoginRequest):
         return {"access_token": access_token, "token_type": "bearer"}
     else:
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+@app.put("/customer/{user_uuid}/edit", dependencies=[Depends(get_current_user)])
+async def edit_customer(user_uuid: str, customer_edit: CustomerEditRequest, current_user: dict = Depends(get_current_user)):
+    if current_user["sub"] != user_uuid:
+        raise HTTPException(status_code=403, detail="You do not have permission to edit this user")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        update_fields = []
+        update_values = []
+
+        if customer_edit.name is not None:
+            update_fields.append("name = %s")
+            update_values.append(customer_edit.name)
+
+        if customer_edit.shippingAddress is not None:
+            update_fields.append("shippingAddress = %s")
+            update_values.append(customer_edit.shippingAddress)
+
+        if customer_edit.email is not None:
+            update_fields.append("email = %s")
+            update_values.append(customer_edit.email)
+
+        if customer_edit.phone is not None:
+            update_fields.append("phone = %s")
+            update_values.append(customer_edit.phone)
+
+        if update_fields:
+            update_values.append(user_uuid)
+            update_query = f"UPDATE Customer SET {', '.join(update_fields)} WHERE uuid = %s"
+            cursor.execute(update_query, tuple(update_values))
+            conn.commit()
+
+    except mysql.connector.Error as err:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {err}")
+    finally:
+        cursor.close()
+        conn.close()
+
+    return {"message": "Customer information updated successfully"}
 
 @app.post("/logout", dependencies=[Depends(get_current_user)])
 async def logout(x_token: str = Header(...), current_user: dict = Depends(get_current_user)):
@@ -252,7 +310,6 @@ async def edit_product(
         conn.close()
         raise HTTPException(status_code=403, detail="You do not have permission to edit this product")
     
-    # Update the product
     cursor.execute(
         "UPDATE Product SET name = %s, description = %s, price = %s, availableItemCount = %s, image = %s WHERE id = %s",
         (name, description, price, availableItem, image_data, product_id)
@@ -305,91 +362,208 @@ def get_all_products():
     return product_list
 
 # Order endpoints
-@app.post("/cart/", dependencies=[Depends(get_current_user)])
-def create_order(order: Order, current_user: dict = Depends(get_current_user)):
+@app.post("/cart/add", dependencies=[Depends(get_current_user)])
+async def add_to_cart(
+    product_id: int = Form(...),
+    quantity: int = Form(...),
+    current_user: dict = Depends(get_current_user)
+):
+    user_uuid = current_user["sub"]
+
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # Check if the user already has a cart
+    cursor.execute("SELECT cartId FROM ShoppingCart WHERE owner = %s", (user_uuid,))
+    cart = cursor.fetchone()
+
+    if not cart:
+        # Create a new cart for the user
+        cursor.execute("INSERT INTO ShoppingCart (owner) VALUES (%s)", (user_uuid,))
+        conn.commit()
+        cart_id = cursor.lastrowid
+    else:
+        cart_id = cart[0]
+
+    # Add item to the cart
     cursor.execute(
-        "INSERT INTO Orders (id, customer_id, product_id, order_status) VALUES (%s, %s, %s, %s)",
-        (order.id, order.customer_id, order.product_id, order.order_status)
+        "INSERT INTO ShoppingCartItem (cartId, productId, quantity) VALUES (%s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE quantity = quantity + VALUES(quantity)",
+        (cart_id, product_id, quantity)
     )
     conn.commit()
     cursor.close()
     conn.close()
-    return {"message": "Order created"}
+    return {"message": "Item added to cart"}
 
-@app.get("/cart/{order_id}", dependencies=[Depends(get_current_user)])
-def get_cart(order_id: int, current_user: dict = Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM Orders WHERE id = %s", (order_id,))
-    order = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    
-    if order:
-        return {"id": order[0], "customer_id": order[1], "product_id": order[2], "order_status": order[3]}
-    raise HTTPException(status_code=404, detail="Order not found")
-
-@app.post("/cart/{user_uuid}/checkout", dependencies=[Depends(get_current_user)])
-def checkout_cart(user_uuid: str, current_user: dict = Depends(get_current_user)):
-    if user_uuid != current_user["sub"]:
-        raise HTTPException(status_code=403, detail="Forbidden")
+@app.get("/cart/", response_model=list[ShoppingCartItemResponse], dependencies=[Depends(get_current_user)])
+async def get_cart(current_user: dict = Depends(get_current_user)):
+    user_uuid = current_user["sub"]
 
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor(dictionary=True)
 
-    # Fetch cart items
-    cursor.execute("SELECT product_id, quantity FROM CartItem WHERE user_uuid = %s", (user_uuid,))
+    query = """
+    SELECT 
+        sci.productId AS product_id, 
+        p.name, 
+        sci.quantity, 
+        p.price
+    FROM 
+        ShoppingCartItem sci
+    JOIN 
+        Product p ON sci.productId = p.id
+    WHERE 
+        sci.cartId = (SELECT cartId FROM ShoppingCart WHERE owner = %s)
+    """
+
+    cursor.execute(query, (user_uuid,))
     cart_items = cursor.fetchall()
 
-    if not cart_items:
-        raise HTTPException(status_code=400, detail="Cart is empty")
-
-    # Create order
-    order_uuid = str(uuid.uuid4())
-    cursor.execute(
-        "INSERT INTO `Order` (uuid, user_uuid, created_at) VALUES (%s, %s, %s)",
-        (order_uuid, user_uuid, datetime.now(datetime.timezone.utc))
-    )
-    conn.commit()
-
-    # Add items to order and calculate total
-    total_amount = 0
-    for item in cart_items:
-        product_id, quantity = item
-        cursor.execute("SELECT price FROM Product WHERE id = %s", (product_id,))
-        product = cursor.fetchone()
-        if product:
-            price = product[0]
-            total_amount += price * quantity
-            cursor.execute(
-                "INSERT INTO OrderItem (order_uuid, product_id, quantity, price) VALUES (%s, %s, %s, %s)",
-                (order_uuid, product_id, quantity, price)
-            )
-        else:
-            raise HTTPException(status_code=404, detail=f"Product with id {product_id} not found")
-
-    conn.commit()
-
-    # Clear cart
-    cursor.execute("DELETE FROM CartItem WHERE user_uuid = %s", (user_uuid,))
-    conn.commit()
-
     cursor.close()
     conn.close()
 
-    # Generate receipt
-    receipt = {
-        "order_uuid": order_uuid,
-        "user_uuid": user_uuid,
-        "total_amount": total_amount,
-        "items": [{"product_id": item[0], "quantity": item[1]} for item in cart_items],
-        "created_at": datetime.now(timezone.utc)
+    if not cart_items:
+        raise HTTPException(status_code=404, detail="Cart is empty")
+
+    return cart_items
+
+@app.post("/cart/checkout", dependencies=[Depends(get_current_user)], response_class=HTMLResponse)
+async def checkout_cart(cartId: int = Form(...), current_user: dict = Depends(get_current_user)):
+    user_uuid = current_user["sub"]
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        # Get cart items
+        cursor.execute("""
+        SELECT 
+            sci.productId AS product_id, 
+            p.name, 
+            p.price, 
+            sci.quantity
+        FROM 
+            ShoppingCartItem sci
+        JOIN 
+            Product p ON sci.productId = p.id
+        WHERE 
+            sci.cartId = %s AND sci.cartId = (SELECT cartId FROM ShoppingCart WHERE owner = %s)
+        """, (cartId, user_uuid))
+        cart_items = cursor.fetchall()
+
+        if not cart_items:
+            cursor.close()
+            conn.close()
+            raise HTTPException(status_code=404, detail="Cart is empty")
+
+        # Convert Decimal to float
+        for item in cart_items:
+            item['price'] = float(item['price'])
+
+        # Calculate total amount
+        total_amount = sum(item['price'] * item['quantity'] for item in cart_items)
+
+        # Generate a unique 5-digit order number
+        while True:
+            order_number = random.randint(10000, 99999)
+            cursor.execute("SELECT 1 FROM CustomerOrder WHERE orderNumber = %s", (order_number,))
+            if not cursor.fetchone():
+                break
+
+        # Create order
+        cursor.execute(
+            "INSERT INTO CustomerOrder (orderNumber, total_amount, status, customer) VALUES (%s, %s, %s, %s)",
+            (order_number, total_amount, 'Pending', user_uuid)
+        )
+        order_id = cursor.lastrowid
+
+        # Add items to orderItems
+        for item in cart_items:
+            cursor.execute(
+                "INSERT INTO orderItems (orderId, productId, quantity, price) VALUES (%s, %s, %s, %s)",
+                (order_id, item['product_id'], item['quantity'], item['price'])
+            )
+
+        # Clear the cart
+        cursor.execute("DELETE FROM ShoppingCartItem WHERE cartId = %s", (cartId,))
+        conn.commit()
+
+        # Get customer details
+        cursor.execute("SELECT userName, email, phone FROM Customer WHERE uuid = %s", (user_uuid,))
+        customer = cursor.fetchone()
+
+    except mysql.connector.Error as err:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {err}")
+    finally:
+        cursor.close()
+        conn.close()
+
+    customer_details = {
+        "first_name": customer['userName'].split()[0],
+        "last_name": " ".join(customer['userName'].split()[1:]),
+        "email": customer['email'],
+        "phone": customer['phone']
     }
 
-    return receipt
+    # Get payment URL from Midtrans
+    payment_url = get_payment_url(order_number, total_amount, customer_details)
 
+    # Generate HTML receipt
+    receipt_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Receipt</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; }}
+            .receipt-container {{ max-width: 600px; margin: auto; padding: 20px; border: 1px solid #ccc; }}
+            .receipt-header {{ text-align: center; }}
+            .receipt-details {{ margin-top: 20px; }}
+            .receipt-details table {{ width: 100%; border-collapse: collapse; }}
+            .receipt-details th, .receipt-details td {{ border: 1px solid #ccc; padding: 8px; text-align: left; }}
+            .receipt-footer {{ margin-top: 20px; text-align: center; }}
+        </style>
+    </head>
+    <body>
+        <div class="receipt-container">
+            <div class="receipt-header">
+                <h1>Receipt</h1>
+                <p>Order Number: {order_number}</p>
+                <p>Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            </div>
+            <div class="receipt-details">
+                <h2>Customer Details</h2>
+                <p>Name: {customer['userName']}</p>
+                <p>Email: {customer['email']}</p>
+                <p>Phone: {customer['phone']}</p>
+                <h2>Order Details</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Product</th>
+                            <th>Quantity</th>
+                            <th>Price</th>
+                            <th>Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {''.join(f"<tr><td>{item['name']}</td><td>{item['quantity']}</td><td>{item['price']}</td><td>{item['price'] * item['quantity']}</td></tr>" for item in cart_items)}
+                    </tbody>
+                </table>
+                <h2>Total Amount: {total_amount}</h2>
+            </div>
+            <div class="receipt-footer">
+                <p>Thank you for your purchase!</p>
+                <p><a href="{payment_url}" target="_blank">Proceed to Payment</a></p>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+    return HTMLResponse(content=receipt_html)
 
 # Shipment endpoints
 @app.post("/shipments/", dependencies=[Depends(get_current_user)])
