@@ -1,5 +1,21 @@
 # api-segerahabis
 api for online shop segerahabis (still incomplete)
+### Currently working gateway
+- [x] /customer/{user_uuid}/edit *
+- [x] /logout *
+- [x] /customers/{customer_uuid} get your profile / other user *
+- [x] /products create product that you wanna sell *
+- [x] /products/{product_id} check specific product data *
+- [x] /products/edit/{products_id} edit specified product **
+- [x] /cart/add add item into your cart *
+- [x] /cart/ get your cart all items *
+- [x] /cart/checkout checkout specified cart id from your cart item list *
+- [x] /allproducts list all product from database into dashboard
+
+note : 
+* stand for just need to login
+** need to login and right ownership privileges
+no asterix means it can be accessed even you're not login
 
 
 ## DB diagram
