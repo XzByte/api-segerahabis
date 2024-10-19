@@ -1,6 +1,6 @@
 # api-segerahabis
 api for online shop segerahabis (still incomplete)
-### Currently working gateway
+### Currently functioning gateway
 - [x] /customer/{user_uuid}/edit *
 - [x] /logout *
 - [x] /customers/{customer_uuid} get your profile / other user *
