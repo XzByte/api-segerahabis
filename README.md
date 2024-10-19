@@ -37,5 +37,8 @@ if you already have the exact table and records like the API's, here's the next 
 4. Build..... using ```docker build -t api-segerahabis .```
 5. Run with ```docker run -d -p 80:80 --name <desired-container-name> api-segerahabis```
 
+## CI/CD and Automation?
+Soon, just the matter of time....
+
 ## Troubleshoot
 already following the step, but found or encounter some error? msg me!
