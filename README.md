@@ -13,8 +13,8 @@ api for online shop segerahabis (still incomplete)
 - [x] /allproducts list all product from database into dashboard
 
 note : 
-* stand for just need to login \
-** need to login and right ownership privileges \
+```*``` stand for just need to login \
+```**``` need to login and right ownership privileges \
 no asterix means it can be accessed even you're not login 
 
 
