@@ -1,6 +1,6 @@
 fastapi
 pydantic
-mysql-connector-python
+mysql-connector-python==9.0.0
 python-dotenv
 bcrypt
 pyjwt
