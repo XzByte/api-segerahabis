@@ -1,0 +1,74 @@
+// Jenkinsfile for loading Secret Files (No Discord Notifications)
+// This example shows how to use secret files (certificates, JSON files, etc.)
+
+pipeline {
+    agent any
+    environment {
+        BRANCH = "staging"
+    }
+    stages {
+        stage('Check pwd') {
+            steps {
+                echo 'checking pwd'
+                sh """
+                    pwd
+                """
+            }
+        }
+
+        stage('Build') {
+            steps {
+                echo 'Building the Docker image...'
+                sh """
+                    echo "Building image: ${HARBOR_REGISTRY}/${env.JOB_NAME}:1.0.${BUILD_NUMBER}"
+                    docker build --build-arg BRANCH=staging --build-arg PORT=80 -t ${HARBOR_REGISTRY}/${env.JOB_NAME}:1.0.${BUILD_NUMBER} .
+                """
+            }
+        }
+        
+        stage('Push') {
+            steps {
+                echo 'Pushing the Docker image to the registry...'
+                retry(3) {
+                    sh "docker push ${HARBOR_REGISTRY}/${env.JOB_NAME}:1.0.${BUILD_NUMBER}"
+                }
+            }
+        }
+        
+        stage('Deploy') {
+            steps {
+                echo 'Deploying the application...'
+                sh """
+                    export KUBECONFIG=${CONFIG_KUBE_STAGING}
+                    kubectl set image deployment/${env.JOB_NAME} ${env.JOB_NAME}=${HARBOR_REGISTRY}/${env.JOB_NAME}:1.0.${BUILD_NUMBER} -n ${NAMESPACE}
+                """
+            }
+        }
+        
+        stage('CLEANUP') {
+            steps {
+                echo 'CLEANING UP OLD DOCKER IMAGES...'
+                sh """
+                    PREVIOUS_BUILD_NUMBER=\$((BUILD_NUMBER - 2))
+                    echo "PREVIOUS BUILD NUMBER: \${PREVIOUS_BUILD_NUMBER}"
+                    docker rmi -f ${HARBOR_REGISTRY}/${JOB_NAME}:1.0.\${PREVIOUS_BUILD_NUMBER} || true
+                    delete_images ${HARBOR_REGISTRY}/${JOB_NAME} 2 || true
+                """
+            }
+        }
+        
+    }
+    
+    post {
+        always {
+            echo 'Cleaning up workspace...'
+
+        }
+        success {
+            echo '✅ Pipeline completed successfully!'
+        }
+        failure {
+            echo '❌ Pipeline failed!'
+        }
+    }
+}
